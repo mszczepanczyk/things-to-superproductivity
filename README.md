@@ -18,8 +18,6 @@ Vibe coded with care, YMMV.
 
 ```sh
 > uvx --from git+https://github.com/mszczepanczyk/things-to-superproductivity things-to-superproductivity --help
-      Built things-to-superproductivity @ git+https://github.com/mszczepanczyk/things-to-superproductivity@267cdc75c26f01b26ef2b9a407746711
-Installed 2 packages in 3ms
 usage: things-to-superproductivity [-h] [-o OUTPUT] [-d THINGS_DB] [--no-area-tags] [--no-someday-tags] [--anytime-tags]
                                    [--keep-dates-on-done] [--no-archive-done]
 
@@ -32,8 +30,9 @@ options:
                         Path to the Things SQLite database file (main.sqlite). Defaults to Things' own database location
                         (/home/mariusz/Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac/Things
                         Database.thingsdatabase/main.sqlite) or $THINGSDB, if set.
-  --no-area-tags        Don't create a tag for tasks that live directly in a Things area (no project). By default such tasks go to the
-                        Inbox project and get a tag named after their area.
+  --no-area-tags        Don't create a tag for tasks that live directly in a Things area (no project), and don't group projects into per-
+                        area folders in Super Productivity's project menu. By default such tasks go to the Inbox project and get a tag
+                        named after their area, and projects that belong to an area are grouped into a folder named after it.
   --no-someday-tags     Don't tag to-dos with a Things 'Someday' start location. Tagged by default, since Super Productivity has no
                         equivalent concept.
   --anytime-tags        Tag to-dos with a Things 'Anytime' start location. Not tagged by default, since Anytime is the common/default
@@ -51,7 +50,9 @@ options:
 | Things | Super Productivity |
 |---|---|
 | Project | Project (notes -> a linked Note entity) |
+| Project's area | a folder grouping the project in Super Productivity's project menu (see `--no-area-tags`); dropped otherwise, since Super Productivity projects have no area/parent field of their own |
 | Tag | Tag |
+| Nested tag (parent tag) | a folder grouping the child tags in Super Productivity's tag menu, named after the parent; the parent stays a normal top-level tag too, since Super Productivity tags have no hierarchy of their own |
 | Checklist item | Sub-task |
 | Deadline | `deadlineDay` |
 | Start/when date | `dueDay` (or `dueWithTime` if the to-do also has a Things reminder time) |

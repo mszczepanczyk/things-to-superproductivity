@@ -20,6 +20,9 @@ import pytest
 
 from things_to_superproductivity.export import (
     INBOX_PROJECT_ID,
+    MENU_TREE_FOLDER,
+    MENU_TREE_PROJECT,
+    MENU_TREE_TAG,
     WEEKDAY_NAMES,
     assert_status,
     build_export,
@@ -435,6 +438,95 @@ def test_project_notes_become_note_entities(tmp_path):
     note = data["note"]["entities"][note_id]
     assert note["content"] == notes_text
     assert note["projectId"] == project["uuid"]
+
+
+def test_projects_grouped_into_area_folders(backup_and_stats):
+    """Super Productivity projects have no area field of their own, so a
+    project's Things area would otherwise vanish entirely on import;
+    instead each area with at least one project becomes a menuTree folder
+    grouping them (see MENU_TREE_FOLDER in export.py). The fixture has two
+    real projects in "Area 1" ("Project in Area 1" and "Cancelled Project
+    in Area") and two projects with no area at all."""
+    backup, _ = backup_and_stats
+    project_tree = backup["data"]["menuTree"]["projectTree"]
+
+    area_uuid = next(
+        a["uuid"]
+        for a in things.areas(filepath=FIXTURE_DB)
+        if a["title"] == "Area 1"
+    )
+    all_projects = things.projects(status=None, filepath=FIXTURE_DB)
+    projects_in_area = {
+        p["uuid"] for p in all_projects if p.get("area") == area_uuid
+    }
+    assert len(projects_in_area) == 2  # sanity check the fixture's shape
+
+    folders = [n for n in project_tree if n["k"] == MENU_TREE_FOLDER]
+    assert len(folders) == 1  # only areas 2/3 have no projects, so no folder
+    folder = folders[0]
+    assert folder["name"] == "Area 1"
+    child_ids = {c["id"] for c in folder["children"]}
+    assert child_ids == projects_in_area
+    assert all(c["k"] == MENU_TREE_PROJECT for c in folder["children"])
+
+    # a project not in any area isn't listed in the tree at all - Super
+    # Productivity appends untracked projects at the top level itself
+    projectless_uuid = next(
+        p["uuid"] for p in all_projects if p["title"] == "Project without Area"
+    )
+    assert not any(
+        node["id"] == projectless_uuid
+        for node in project_tree
+        if node["k"] == MENU_TREE_PROJECT
+    )
+
+
+def test_area_folders_disabled_with_no_area_tags():
+    backup, _ = build_export(db_path=FIXTURE_DB, area_tags=False)
+    assert backup["data"]["menuTree"]["projectTree"] == []
+
+
+def _copy_fixture_with_tag_parent(tmp_path, child_uuid, parent_uuid):
+    """Copy the fixture DB and set one tag's parent to another, so the
+    nested-tag-folder mapping can be exercised (no tag in the fixture has
+    a parent set), without mutating the checked-in fixture."""
+    dest_dir = tmp_path / "db"
+    dest_dir.mkdir()
+    fixtures_dir = Path(FIXTURE_DB).parent
+    for name in ("main.sqlite", "main.sqlite-wal", "main.sqlite-shm"):
+        shutil.copy(fixtures_dir / name, dest_dir / name)
+    dest_db = dest_dir / "main.sqlite"
+
+    conn = sqlite3.connect(dest_db)
+    conn.execute("UPDATE TMTag SET parent = ? WHERE uuid = ?", (parent_uuid, child_uuid))
+    conn.commit()
+    conn.close()
+    return str(dest_db)
+
+
+def test_nested_tag_becomes_tag_folder(tmp_path):
+    """Things nested tags aren't queried by things.py at all (get_tags()
+    doesn't select TMTag.parent), and Super Productivity tags have no
+    hierarchy of their own - a child tag is grouped into a menuTree folder
+    named after its parent, while the parent stays a normal, independently
+    usable top-level tag."""
+    tags = things.tags(filepath=FIXTURE_DB)
+    parent, child = tags[0], tags[1]
+    db_path = _copy_fixture_with_tag_parent(tmp_path, child["uuid"], parent["uuid"])
+
+    backup, _ = build_export(db_path=db_path)
+    tag_tree = backup["data"]["menuTree"]["tagTree"]
+
+    assert len(tag_tree) == 1
+    folder = tag_tree[0]
+    assert folder["k"] == MENU_TREE_FOLDER
+    assert folder["name"] == parent["title"]
+    assert folder["children"] == [{"id": child["uuid"], "k": MENU_TREE_TAG}]
+
+    # the parent tag itself is still a normal top-level tag, not folded
+    # away into the folder
+    assert parent["uuid"] in backup["data"]["tag"]["entities"]
+    assert not any(node["id"] == parent["uuid"] for node in tag_tree)
 
 
 # --- recurring to-dos ---

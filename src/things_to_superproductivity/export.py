@@ -4,7 +4,9 @@ See README.md for the destructive-import warning and the Things -> Super
 Productivity mapping. The output schema itself was reverse engineered from
 Super Productivity's own e2e test fixture (e2e/fixtures/test-backup.json)
 and source (src/app/op-log/backup/backup.service.ts), matching
-crossModelVersion 4.5.
+crossModelVersion 4.5. The menuTree folder shape (grouping projects/tags for
+display) comes from src/app/features/menu-tree/store/menu-tree.model.ts and
+is validated by src/app/op-log/validation/is-related-model-data-valid.ts.
 """
 
 import plistlib
@@ -22,6 +24,17 @@ from things_to_superproductivity.sp_defaults import (
 CROSS_MODEL_VERSION = 4.5
 
 INBOX_PROJECT_ID = "INBOX_PROJECT"
+
+# Super Productivity's menuTree node kinds (src/app/features/menu-tree/store/
+# menu-tree.model.ts MenuTreeKind): 'f' groups children under a named,
+# purely-visual folder; 'p'/'t' are references to a real project/tag entity.
+# Any project/tag id not mentioned anywhere in the tree is appended at the
+# top level automatically (menu-tree.service.ts _buildViewTree), so this
+# only needs to list the ids worth grouping - everything else is left out
+# and falls back to that default flat placement.
+MENU_TREE_FOLDER = "f"
+MENU_TREE_PROJECT = "p"
+MENU_TREE_TAG = "t"
 
 # Things' rt1_recurrenceRule is an undocumented binary plist. This mapping
 # was reverse engineered against a real Things database (24 recurring
@@ -359,11 +372,64 @@ def build_export(
             }
             project_entities[p["uuid"]]["noteIds"].append(note_id)
 
+    # --- project menu folders (Things area -> a menuTree folder per area) ---
+    # Super Productivity's project model has no area/parent field, so a
+    # project's area membership would otherwise vanish entirely on import.
+    # Folders are purely a display grouping (see MENU_TREE_FOLDER above),
+    # so this only needs an entry per project that actually has an area;
+    # everything else keeps landing at the top level like before.
+    project_tree = []
+    if area_tags:
+        project_ids_by_area_uuid = {}
+        for p in things_projects:
+            area_uuid = p.get("area")
+            if area_uuid:
+                project_ids_by_area_uuid.setdefault(area_uuid, []).append(p["uuid"])
+        for area_uuid, area_title in areas.items():
+            area_project_ids = project_ids_by_area_uuid.get(area_uuid)
+            if area_project_ids:
+                project_tree.append(
+                    {
+                        "id": f"area-folder-{area_uuid}",
+                        "k": MENU_TREE_FOLDER,
+                        "name": area_title,
+                        "children": [
+                            {"id": pid, "k": MENU_TREE_PROJECT}
+                            for pid in area_project_ids
+                        ],
+                    }
+                )
+
     # --- recurring task templates ---
     # things.py excludes every recurring template from all its query
     # methods (their SQL always filters `rt1_recurrenceRule IS NULL`), so
     # templates have to be queried directly off the underlying table.
     db = things.Database(**kwargs)
+
+    # --- tag menu folders (Things nested tags -> a menuTree folder per
+    # parent tag) --- things.py's own get_tags() doesn't select TMTag.parent
+    # at all, so it's queried directly here, the same way recurring
+    # templates are below. A parent tag stays a real, independently
+    # usable top-level tag (Super Productivity tags have no hierarchy of
+    # their own); only its children move into a folder named after it.
+    tag_tree = []
+    folder_by_parent_tag_uuid = {}
+    for row in db.execute_query("SELECT uuid, parent FROM TMTag WHERE parent IS NOT NULL"):
+        child_uuid, parent_uuid = row["uuid"], row["parent"]
+        if child_uuid not in tag_entities or parent_uuid not in tag_entities:
+            continue  # orphaned reference (e.g. parent tag was trashed)
+        folder = folder_by_parent_tag_uuid.get(parent_uuid)
+        if folder is None:
+            folder = {
+                "id": f"tag-folder-{parent_uuid}",
+                "k": MENU_TREE_FOLDER,
+                "name": tag_entities[parent_uuid]["title"],
+                "children": [],
+            }
+            folder_by_parent_tag_uuid[parent_uuid] = folder
+            tag_tree.append(folder)
+        folder["children"].append({"id": child_uuid, "k": MENU_TREE_TAG})
+
     template_rows = db.execute_query(
         make_tasks_sql_query(
             where_predicate="TASK.rt1_recurrenceRule IS NOT NULL AND TASK.trashed = 0"
@@ -521,7 +587,7 @@ def build_export(
 
     data = {
         "project": {"ids": project_ids, "entities": project_entities},
-        "menuTree": {"tagTree": [], "projectTree": []},
+        "menuTree": {"tagTree": tag_tree, "projectTree": project_tree},
         "globalConfig": GLOBAL_CONFIG,
         "task": {
             "ids": task_ids,

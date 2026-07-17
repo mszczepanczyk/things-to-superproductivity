@@ -35,8 +35,11 @@ def main() -> None:
         "--no-area-tags",
         action="store_true",
         help="Don't create a tag for tasks that live directly in a Things area "
-        "(no project). By default such tasks go to the Inbox project and "
-        "get a tag named after their area.",
+        "(no project), and don't group projects into per-area folders in "
+        "Super Productivity's project menu. By default such tasks go to "
+        "the Inbox project and get a tag named after their area, and "
+        "projects that belong to an area are grouped into a folder named "
+        "after it.",
     )
     parser.add_argument(
         "--no-someday-tags",
