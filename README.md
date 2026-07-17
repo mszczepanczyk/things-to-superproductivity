@@ -63,6 +63,7 @@ options:
 | Inbox start location | no tag - these to-dos have no project or area either, so they land in the Inbox project |
 | Canceled to-do | marked done, tagged "Canceled" (always on) |
 | Completed/canceled to-do | moved to the archive (see `--no-archive-done`) |
+| Recurring to-do | a `taskRepeatCfg`, linked back to every instance to-do via `repeatCfgId` (checklist items are not carried onto *future* instances Super Productivity generates - only onto the ones already in Things) |
 
 ## Development
 

@@ -7,9 +7,11 @@ and source (src/app/op-log/backup/backup.service.ts), matching
 crossModelVersion 4.5.
 """
 
-from datetime import datetime
+import plistlib
+from datetime import datetime, timezone
 
 import things
+from things.database import make_tasks_sql_query
 
 from things_to_superproductivity.sp_defaults import (
     DEFAULT_ADVANCED_CFG,
@@ -21,6 +23,22 @@ CROSS_MODEL_VERSION = 4.5
 
 INBOX_PROJECT_ID = "INBOX_PROJECT"
 
+# Things' rt1_recurrenceRule is an undocumented binary plist. This mapping
+# was reverse engineered against a real Things database (24 recurring
+# to-dos spanning all four cycles), cross-checked against each to-do's
+# actual configured schedule - there's no public documentation of this
+# format to verify against otherwise.
+RECURRENCE_UNIT_TO_CYCLE = {4: "YEARLY", 8: "MONTHLY", 16: "DAILY", 256: "WEEKLY"}
+WEEKDAY_NAMES = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+]
+
 
 def to_epoch_ms(datetime_str):
     """Convert a Things 'YYYY-MM-DD HH:MM:SS' localtime string to epoch ms."""
@@ -31,6 +49,119 @@ def assert_status(status, uuid):
     if status not in ("incomplete", "completed", "canceled"):
         raise ValueError(f"unexpected status {status!r} for {uuid!r}")
     return status
+
+
+def thingsdate_to_isodate(epoch_seconds):
+    """Convert a rt1_recurrenceRule plist date (seconds since the Unix
+    epoch, at UTC midnight) to an ISO date string."""
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).date().isoformat()
+
+
+def decode_recurrence_rule(blob, uuid):
+    """Decode a Things rt1_recurrenceRule plist blob into the pieces needed
+    for a Super Productivity taskRepeatCfg.
+
+    Raises rather than guesses for any shape not seen in the real database
+    this was reverse engineered against (a limited occurrence count, or
+    more than one monthly/yearly anchor) - a silently wrong recurrence
+    schedule is worse than a to-do exported without one.
+    """
+    rule = plistlib.loads(blob)
+
+    unit = rule.get("fu")
+    if unit not in RECURRENCE_UNIT_TO_CYCLE:
+        raise ValueError(f"unknown Things recurrence unit {unit!r} for {uuid!r}")
+    cycle = RECURRENCE_UNIT_TO_CYCLE[unit]
+
+    recurrence_type = rule.get("tp")
+    if recurrence_type not in (0, 1):
+        raise ValueError(
+            f"unknown Things recurrence type {recurrence_type!r} for {uuid!r}"
+        )
+
+    if rule.get("rc"):
+        raise ValueError(
+            f"recurring to-do {uuid!r} has a limited occurrence count, which "
+            "Super Productivity's taskRepeatCfg has no equivalent for"
+        )
+
+    offsets = rule.get("of") or []
+    weekday_flags = {}
+    monthly_last_day = False
+    if cycle == "WEEKLY":
+        for offset in offsets:
+            weekday_flags[WEEKDAY_NAMES[offset["wd"]]] = True
+    elif cycle in ("MONTHLY", "YEARLY"):
+        if len(offsets) > 1:
+            raise ValueError(
+                f"recurring to-do {uuid!r} has more than one {cycle.lower()} "
+                "anchor, which Super Productivity's taskRepeatCfg has no "
+                "equivalent for"
+            )
+        if cycle == "MONTHLY" and offsets and offsets[0].get("dy") == -1:
+            monthly_last_day = True
+
+    end_date = thingsdate_to_isodate(rule["ed"]) if rule.get("ed") else None
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    return {
+        "cycle": cycle,
+        "repeat_every": rule.get("fa") or 1,
+        "start_date": thingsdate_to_isodate(rule["ia"]),
+        "weekday_flags": weekday_flags,
+        "monthly_last_day": monthly_last_day,
+        "repeat_from_completion": recurrence_type == 1,
+        "is_expired": end_date is not None and end_date <= today,
+    }
+
+
+def make_task_repeat_cfg(id_, title, project_id, tag_ids, notes, is_paused, rule):
+    now = datetime.now(timezone.utc)
+    cfg = {
+        "id": id_,
+        "projectId": project_id,
+        "title": title,
+        "tagIds": tag_ids,
+        "order": 0,
+        "defaultEstimate": None,
+        "startTime": None,
+        "remindAt": None,
+        "isPaused": is_paused,
+        "quickSetting": "CUSTOM",
+        "repeatCycle": rule["cycle"],
+        "startDate": rule["start_date"],
+        "repeatEvery": rule["repeat_every"],
+        "notes": notes or None,
+        "shouldInheritSubtasks": False,
+        "repeatFromCompletionDate": rule["repeat_from_completion"],
+        "waitForCompletion": False,
+        "disableAutoUpdateSubtasks": False,
+        "skipOverdue": False,
+        # Anchored to "now" rather than any real last-generated-instance
+        # date: Things' own past instances are exported as plain to-dos
+        # (see repeatCfgId assignment in build_export), so Super
+        # Productivity has no backlog to catch up on - only future
+        # occurrences should come from this cfg.
+        "lastTaskCreation": int(now.timestamp() * 1000),
+        "lastTaskCreationDay": now.date().isoformat(),
+    }
+    for day in WEEKDAY_NAMES:
+        cfg[day] = rule["weekday_flags"].get(day, False)
+    if rule["monthly_last_day"]:
+        cfg["monthlyLastDay"] = True
+    return cfg
+
+
+def resolve_project_id_and_title(todo, heading_to_project):
+    project_id = todo.get("project")
+    heading_title = None
+    if not project_id and todo.get("heading"):
+        project_id = heading_to_project[todo["heading"]]
+        heading_title = todo["heading_title"]
+    if not project_id:
+        project_id = INBOX_PROJECT_ID
+    title = f"{heading_title} > {todo['title']}" if heading_title else todo["title"]
+    return project_id, title
 
 
 def make_work_context_common(id_, title, task_ids, icon=None):
@@ -218,6 +349,58 @@ def build_export(
             }
             project_entities[p["uuid"]]["noteIds"].append(note_id)
 
+    # --- recurring task templates ---
+    # things.py excludes every recurring template from all its query
+    # methods (their SQL always filters `rt1_recurrenceRule IS NULL`), so
+    # templates have to be queried directly off the underlying table.
+    db = things.Database(**kwargs)
+    template_rows = db.execute_query(
+        make_tasks_sql_query(
+            where_predicate="TASK.rt1_recurrenceRule IS NOT NULL AND TASK.trashed = 0"
+        )
+    )
+    recurrence_raw_by_uuid = {
+        row["uuid"]: row
+        for row in db.execute_query(
+            "SELECT uuid, rt1_recurrenceRule AS recurrence_rule, "
+            "rt1_instanceCreationPaused AS is_paused FROM TMTask "
+            "WHERE rt1_recurrenceRule IS NOT NULL AND trashed = 0"
+        )
+    }
+    instance_to_template = {
+        row["uuid"]: row["template_uuid"]
+        for row in db.execute_query(
+            "SELECT uuid, rt1_repeatingTemplate AS template_uuid FROM TMTask "
+            "WHERE rt1_repeatingTemplate IS NOT NULL AND rt1_repeatingTemplate != ''"
+        )
+    }
+
+    repeat_cfg_ids = []
+    repeat_cfg_entities = {}
+    for row in template_rows:
+        raw = recurrence_raw_by_uuid[row["uuid"]]
+        rule = decode_recurrence_rule(raw["recurrence_rule"], row["uuid"])
+        if rule["is_expired"]:
+            # Things itself stopped generating instances for this
+            # to-do - treat it like any other non-recurring to-do.
+            continue
+        template_project_id, template_title = resolve_project_id_and_title(
+            row, heading_to_project
+        )
+        template_tag_ids = [
+            tag_id_by_title[t] for t in (db.get_tags(task=row["uuid"]) or [])
+        ]
+        repeat_cfg_ids.append(row["uuid"])
+        repeat_cfg_entities[row["uuid"]] = make_task_repeat_cfg(
+            row["uuid"],
+            template_title,
+            template_project_id,
+            template_tag_ids,
+            row["notes"],
+            bool(raw["is_paused"]),
+            rule,
+        )
+
     # --- tasks (+ checklist items as sub-tasks) ---
     task_ids = []
     task_entities = {}
@@ -236,13 +419,7 @@ def build_export(
         else:
             done_on = None
 
-        project_id = todo.get("project")
-        heading_title = None
-        if not project_id and todo.get("heading"):
-            project_id = heading_to_project[todo["heading"]]
-            heading_title = todo["heading_title"]
-        if not project_id:
-            project_id = INBOX_PROJECT_ID
+        project_id, title = resolve_project_id_and_title(todo, heading_to_project)
 
         this_tag_ids = [
             tag_id_by_title[title] for title in (todo.get("tags") or [])
@@ -256,8 +433,6 @@ def build_export(
             this_tag_ids.append(get_special_tag_id("Anytime"))
         if status == "canceled":
             this_tag_ids.append(get_special_tag_id("Canceled"))
-
-        title = f"{heading_title} > {todo['title']}" if heading_title else todo["title"]
 
         sub_task_ids = []
         for item in todo.get("checklist") or []:
@@ -310,6 +485,9 @@ def build_export(
                 task["deadlineDay"] = todo["deadline"]
         if is_done:
             task["doneOn"] = done_on
+        repeat_cfg_id = instance_to_template.get(todo["uuid"])
+        if repeat_cfg_id in repeat_cfg_entities:
+            task["repeatCfgId"] = repeat_cfg_id
 
         if archive_this_task:
             archive_task_ids.append(todo["uuid"])
@@ -335,7 +513,7 @@ def build_export(
         },
         "tag": {"ids": tag_ids, "entities": tag_entities},
         "simpleCounter": {"ids": [], "entities": {}},
-        "taskRepeatCfg": {"ids": [], "entities": {}},
+        "taskRepeatCfg": {"ids": repeat_cfg_ids, "entities": repeat_cfg_entities},
         "reminders": [],
         "note": {"ids": note_ids, "entities": note_entities, "todayOrder": []},
         "metric": {"ids": [], "entities": {}},
@@ -367,6 +545,7 @@ def build_export(
         "projects": len(things_projects),
         "tags": len(things_tags),
         "areas": len(areas),
+        "recurring_configs": len(repeat_cfg_ids),
         "tasks": len(task_ids)
         - sum(len(e.get("subTaskIds", [])) for e in task_entities.values()),
         "subtasks": sum(len(e.get("subTaskIds", [])) for e in task_entities.values()),

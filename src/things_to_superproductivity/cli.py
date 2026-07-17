@@ -91,7 +91,7 @@ def main() -> None:
     print(
         f"  {stats['tasks']} tasks, {stats['subtasks']} sub-tasks, "
         f"{stats['projects']} projects, {stats['tags']} tags, "
-        f"{stats['areas']} areas",
+        f"{stats['areas']} areas, {stats['recurring_configs']} recurring configs",
         file=sys.stderr,
     )
     if stats["archived_tasks"] or stats["archived_subtasks"]:

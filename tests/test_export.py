@@ -9,8 +9,10 @@ package (its sdist/wheel only contain the `things` module, not the
 correct even if the upstream fixture changes.
 """
 
+import plistlib
 import shutil
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import things
@@ -18,8 +20,10 @@ import pytest
 
 from things_to_superproductivity.export import (
     INBOX_PROJECT_ID,
+    WEEKDAY_NAMES,
     assert_status,
     build_export,
+    decode_recurrence_rule,
 )
 
 FIXTURE_DB = str(Path(__file__).parent / "fixtures" / "main.sqlite")
@@ -412,3 +416,226 @@ def test_project_notes_become_note_entities(tmp_path):
     note = data["note"]["entities"][note_id]
     assert note["content"] == notes_text
     assert note["projectId"] == project["uuid"]
+
+
+# --- recurring to-dos ---
+#
+# Things' rt1_recurrenceRule is an undocumented binary plist; the fixture
+# has exactly one real recurring to-do ("Repeating To-Do", weekly on
+# Sunday). To exercise the other shapes (daily/monthly/yearly/multi-
+# weekday) this mapping supports, these tests inject synthetic
+# rt1_recurrenceRule blobs onto an existing plain to-do in a copied DB,
+# the same way test_project_notes_become_note_entities injects notes.
+
+# "To-Do in Inbox": a plain incomplete to-do in the fixture with no
+# existing recurrence rule, repurposed below as a synthetic template.
+PLAIN_TODO_UUID = "DfYoiXcNLQssk9DkSoJV3Y"
+
+
+def _epoch_utc_midnight(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
+
+FAR_FUTURE_END_DATE = _epoch_utc_midnight("4001-01-01")
+
+
+def _copy_fixture_with_recurrence(tmp_path, uuid, rule_overrides, is_paused=0):
+    """Copy the fixture DB and turn an existing plain to-do into a
+    synthetic recurring template by injecting a specific
+    rt1_recurrenceRule plist, without mutating the checked-in fixture."""
+    dest_dir = tmp_path / "db"
+    dest_dir.mkdir()
+    fixtures_dir = Path(FIXTURE_DB).parent
+    for name in ("main.sqlite", "main.sqlite-wal", "main.sqlite-shm"):
+        shutil.copy(fixtures_dir / name, dest_dir / name)
+    dest_db = dest_dir / "main.sqlite"
+
+    rule = {
+        "ed": FAR_FUTURE_END_DATE,
+        "fa": 1,
+        "rc": 0,
+        "rrv": 4,
+        "sr": _epoch_utc_midnight("2024-01-01"),
+        "ts": 0,
+        **rule_overrides,
+    }
+    blob = plistlib.dumps(rule)
+
+    conn = sqlite3.connect(dest_db)
+    conn.execute(
+        "UPDATE TMTask SET rt1_recurrenceRule = ?, rt1_instanceCreationPaused = ? "
+        "WHERE uuid = ?",
+        (blob, is_paused, uuid),
+    )
+    conn.commit()
+    conn.close()
+    return str(dest_db)
+
+
+def test_recurring_todo_linked_to_repeat_cfg(backup_and_stats):
+    """The fixture's one real recurring to-do should get a taskRepeatCfg
+    entity, and its live instance should reference it via repeatCfgId."""
+    backup, stats = backup_and_stats
+    assert stats["recurring_configs"] == 1
+    cfg_id, cfg = next(iter(backup["data"]["taskRepeatCfg"]["entities"].items()))
+    assert cfg["title"] == "Repeating To-Do"
+    assert cfg["repeatCycle"] == "WEEKLY"
+    assert cfg["sunday"] is True
+    assert cfg["repeatEvery"] == 1
+
+    linked = [
+        t
+        for t in backup["data"]["task"]["entities"].values()
+        if t.get("repeatCfgId") == cfg_id
+    ]
+    assert len(linked) == 1
+    assert linked[0]["title"] == "Repeating To-Do"
+
+
+def test_daily_recurrence(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {"fu": 16, "tp": 0, "of": [{"dy": 0}], "ia": _epoch_utc_midnight("2024-03-05")},
+    )
+    backup, stats = build_export(db_path=db_path)
+    assert stats["recurring_configs"] == 2  # the fixture's own + this one
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["repeatCycle"] == "DAILY"
+    assert cfg["startDate"] == "2024-03-05"
+    assert not any(cfg[day] for day in WEEKDAY_NAMES)
+
+
+def test_monthly_last_day_recurrence(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {"fu": 8, "tp": 0, "of": [{"dy": -1}], "ia": _epoch_utc_midnight("2024-02-29")},
+    )
+    backup, _ = build_export(db_path=db_path)
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["repeatCycle"] == "MONTHLY"
+    assert cfg["monthlyLastDay"] is True
+
+
+def test_monthly_day_of_month_recurrence(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {"fu": 8, "tp": 0, "of": [{"dy": 14}], "ia": _epoch_utc_midnight("2024-06-15")},
+    )
+    backup, _ = build_export(db_path=db_path)
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["repeatCycle"] == "MONTHLY"
+    assert cfg["startDate"] == "2024-06-15"
+    assert "monthlyLastDay" not in cfg
+
+
+def test_yearly_recurrence(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {
+            "fu": 4,
+            "tp": 0,
+            "of": [{"dy": 19, "mo": 10}],
+            "ia": _epoch_utc_midnight("2020-11-20"),
+        },
+    )
+    backup, _ = build_export(db_path=db_path)
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["repeatCycle"] == "YEARLY"
+    assert cfg["startDate"] == "2020-11-20"
+
+
+def test_weekly_multi_weekday_recurrence(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {
+            "fu": 256,
+            "tp": 0,
+            "of": [{"wd": 1}, {"wd": 3}, {"wd": 5}],
+            "ia": _epoch_utc_midnight("2024-03-04"),
+        },
+    )
+    backup, _ = build_export(db_path=db_path)
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["repeatCycle"] == "WEEKLY"
+    assert [day for day in WEEKDAY_NAMES if cfg[day]] == [
+        "monday",
+        "wednesday",
+        "friday",
+    ]
+
+
+def test_paused_and_repeat_from_completion_flags(tmp_path):
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {"fu": 16, "tp": 1, "of": [{"dy": 0}], "ia": _epoch_utc_midnight("2024-03-05")},
+        is_paused=1,
+    )
+    backup, _ = build_export(db_path=db_path)
+    cfg = backup["data"]["taskRepeatCfg"]["entities"][PLAIN_TODO_UUID]
+    assert cfg["isPaused"] is True
+    assert cfg["repeatFromCompletionDate"] is True
+
+
+def test_expired_recurrence_treated_as_plain_task(tmp_path):
+    """A recurrence whose end date has already passed is no longer
+    actually recurring in Things either (it stops generating new
+    instances), so it's exported like any other one-off to-do."""
+    db_path = _copy_fixture_with_recurrence(
+        tmp_path,
+        PLAIN_TODO_UUID,
+        {
+            "fu": 16,
+            "tp": 0,
+            "of": [{"dy": 0}],
+            "ia": _epoch_utc_midnight("2020-01-01"),
+            "ed": _epoch_utc_midnight("2020-06-01"),
+        },
+    )
+    backup, stats = build_export(db_path=db_path)
+    assert stats["recurring_configs"] == 1  # only the fixture's real one
+    assert PLAIN_TODO_UUID not in backup["data"]["taskRepeatCfg"]["entities"]
+
+
+def _make_rule_blob(**overrides):
+    rule = {
+        "ed": FAR_FUTURE_END_DATE,
+        "fa": 1,
+        "fu": 16,
+        "ia": _epoch_utc_midnight("2024-01-01"),
+        "of": [{"dy": 0}],
+        "rc": 0,
+        "rrv": 4,
+        "sr": _epoch_utc_midnight("2024-01-01"),
+        "tp": 0,
+        "ts": 0,
+        **overrides,
+    }
+    return plistlib.dumps(rule)
+
+
+def test_decode_recurrence_rule_rejects_unknown_unit():
+    with pytest.raises(ValueError):
+        decode_recurrence_rule(_make_rule_blob(fu=999), "some-uuid")
+
+
+def test_decode_recurrence_rule_rejects_unknown_type():
+    with pytest.raises(ValueError):
+        decode_recurrence_rule(_make_rule_blob(tp=2), "some-uuid")
+
+
+def test_decode_recurrence_rule_rejects_limited_occurrence_count():
+    with pytest.raises(ValueError):
+        decode_recurrence_rule(_make_rule_blob(rc=5), "some-uuid")
+
+
+def test_decode_recurrence_rule_rejects_multiple_monthly_anchors():
+    with pytest.raises(ValueError):
+        decode_recurrence_rule(
+            _make_rule_blob(fu=8, of=[{"dy": 1}, {"dy": 15}]), "some-uuid"
+        )
