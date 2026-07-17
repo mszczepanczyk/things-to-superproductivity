@@ -263,7 +263,7 @@ def test_dates_are_mapped_for_open_tasks(backup_and_stats):
         todo = todos_by_uuid.get(uuid)
         if todo is None or task["isDone"]:
             continue  # a sub-task (checklist item) or a done task
-        if todo.get("start_date"):
+        if todo.get("start_date") and not todo.get("reminder_time"):
             assert task["dueDay"] == todo["start_date"]
             checked_due += 1
         if todo.get("deadline"):
@@ -273,6 +273,25 @@ def test_dates_are_mapped_for_open_tasks(backup_and_stats):
     # sanity check the fixture actually exercises both fields
     assert checked_due > 0
     assert checked_deadline > 0
+
+
+def test_reminder_time_becomes_due_with_time(backup_and_stats):
+    """A Things to-do with a reminder time gets `dueWithTime` (an epoch ms
+    timestamp) instead of a bare `dueDay`, so it shows up in Super
+    Productivity's "Scheduled" list (which only lists tasks that have a
+    specific time, not just a day)."""
+    backup, _ = backup_and_stats
+    todos = things.todos(status=None, filepath=FIXTURE_DB)
+    with_reminder = [t for t in todos if t.get("reminder_time")]
+    assert len(with_reminder) > 0  # sanity check the fixture exercises this
+
+    for todo in with_reminder:
+        task = _find_task(backup, todo["uuid"])
+        assert "dueDay" not in task
+        expected = datetime.strptime(
+            f"{todo['start_date']} {todo['reminder_time']}", "%Y-%m-%d %H:%M"
+        )
+        assert task["dueWithTime"] == int(expected.timestamp() * 1000)
 
 
 def test_dates_dropped_for_done_tasks_by_default(backup_and_stats):
@@ -482,6 +501,8 @@ def test_recurring_todo_linked_to_repeat_cfg(backup_and_stats):
     assert cfg["repeatCycle"] == "WEEKLY"
     assert cfg["sunday"] is True
     assert cfg["repeatEvery"] == 1
+    # the fixture's template also has a reminder time set
+    assert cfg["startTime"] == "12:00"
 
     linked = [
         t

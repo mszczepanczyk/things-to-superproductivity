@@ -45,6 +45,14 @@ def to_epoch_ms(datetime_str):
     dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
     return int(dt.timestamp() * 1000)
 
+
+def to_epoch_ms_with_time(date_str, time_str):
+    """Combine a Things 'YYYY-MM-DD' start date and 'HH:MM' reminder time
+    (both localtime) into epoch ms."""
+    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    return int(dt.timestamp() * 1000)
+
+
 def assert_status(status, uuid):
     if status not in ("incomplete", "completed", "canceled"):
         raise ValueError(f"unexpected status {status!r} for {uuid!r}")
@@ -115,7 +123,9 @@ def decode_recurrence_rule(blob, uuid):
     }
 
 
-def make_task_repeat_cfg(id_, title, project_id, tag_ids, notes, is_paused, rule):
+def make_task_repeat_cfg(
+    id_, title, project_id, tag_ids, notes, is_paused, rule, start_time=None
+):
     now = datetime.now(timezone.utc)
     cfg = {
         "id": id_,
@@ -124,7 +134,7 @@ def make_task_repeat_cfg(id_, title, project_id, tag_ids, notes, is_paused, rule
         "tagIds": tag_ids,
         "order": 0,
         "defaultEstimate": None,
-        "startTime": None,
+        "startTime": start_time,
         "remindAt": None,
         "isPaused": is_paused,
         "quickSetting": "CUSTOM",
@@ -399,6 +409,7 @@ def build_export(
             row["notes"],
             bool(raw["is_paused"]),
             rule,
+            row.get("reminder_time"),
         )
 
     # --- tasks (+ checklist items as sub-tasks) ---
@@ -480,7 +491,16 @@ def build_export(
         }
         if dates_on_done or not is_done:
             if todo.get("start_date"):
-                task["dueDay"] = todo["start_date"]
+                # dueWithTime and dueDay are mutually exclusive in Super
+                # Productivity's task model - a to-do with a Things reminder
+                # time gets the precise timestamp instead of a bare day, so
+                # it shows up in SP's "Scheduled" list.
+                if todo.get("reminder_time"):
+                    task["dueWithTime"] = to_epoch_ms_with_time(
+                        todo["start_date"], todo["reminder_time"]
+                    )
+                else:
+                    task["dueDay"] = todo["start_date"]
             if todo.get("deadline"):
                 task["deadlineDay"] = todo["deadline"]
         if is_done:
