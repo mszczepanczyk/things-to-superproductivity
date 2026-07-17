@@ -1,0 +1,25 @@
+[project]
+name = "things-to-superproductivity"
+version = "0.1.0"
+description = "Export a Things 3 database into a Super Productivity backup file"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "Mariusz Szczepańczyk", email = "m@mariusz.sh" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "things-py>=1.0.1",
+]
+
+[project.scripts]
+things-to-superproductivity = "things_to_superproductivity:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
