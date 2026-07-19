@@ -14,6 +14,9 @@ first if you have anything in there you want to keep.
 
 Vibe coded with care, YMMV.
 
+**Note: headings are imported as "Heading > Title" within the task name, they
+probably should map to Super Productivity's "sections" instead.**
+
 ## Usage
 
 ```sh
